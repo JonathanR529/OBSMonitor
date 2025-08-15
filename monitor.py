@@ -6,11 +6,16 @@ import os
 import sys
 import logging
 from typing import Set
-import pyaudio
-import numpy as np
 import keyboard
 import wx
 from accessible_output3.outputs import auto
+import ctypes
+from ctypes import wintypes
+import math
+
+# Windows DLL imports
+kernel32 = ctypes.windll.kernel32
+winmm = ctypes.windll.winmm
 
 class ConfigDialog(wx.Dialog):
     def __init__(self):
@@ -192,6 +197,42 @@ class ConfigDialog(wx.Dialog):
             'use_tones': self.use_tones
         }
 
+class WindowsToneGenerator:
+    """Windows-based tone generator using kernel32.dll Beep function"""
+    
+    def __init__(self, volume=0.4):
+        self.volume = volume  # Note: Windows Beep doesn't support volume control
+        self.audio_lock = threading.Lock()
+        
+    def play_tone_blocking(self, frequency, duration=0.1):
+        """Play a single tone using Windows Beep function"""
+        with self.audio_lock:
+            try:
+                # Convert duration from seconds to milliseconds
+                duration_ms = int(duration * 1000)
+                # Ensure frequency is within valid range (37 to 32767 Hz)
+                frequency = max(37, min(32767, int(frequency)))
+                kernel32.Beep(frequency, duration_ms)
+            except Exception as e:
+                print(f"Error playing tone {frequency}Hz: {e}")
+    
+    def play_chord_blocking(self, frequencies, duration=0.15):
+        """Play multiple frequencies sequentially (Windows Beep can't play simultaneous tones)"""
+        # Since Windows Beep can't play simultaneous tones, we'll play them in quick succession
+        chord_duration = duration / len(frequencies)
+        for freq in frequencies:
+            self.play_tone_blocking(freq, chord_duration)
+    
+    def play_sequence_blocking(self, frequencies, durations, gaps=None):
+        """Play a sequence of tones with gaps"""
+        if gaps is None:
+            gaps = [0.05] * (len(frequencies) - 1)
+        
+        for i, (freq, dur) in enumerate(zip(frequencies, durations)):
+            self.play_tone_blocking(freq, dur)
+            if i < len(gaps):
+                time.sleep(gaps[i])
+
 class OBSSourceMonitor:
     def __init__(self):
         # Initialize speech output
@@ -207,7 +248,6 @@ class OBSSourceMonitor:
         self.volume = self.config['volume']
         self.poll_interval = self.config['poll_interval']
         self.max_consecutive_errors = self.config['max_consecutive_errors']
-        self.sample_rate = self.config['sample_rate']
         
         # Notification settings
         self.use_speech = self.config.get('use_speech', False)  # Default to False
@@ -226,13 +266,10 @@ class OBSSourceMonitor:
         # Threading locks
         self.exit_lock = threading.Lock()
         self.monitor_lock = threading.Lock()
-        self.audio_lock = threading.Lock()
         self.speech_lock = threading.Lock()
         
-        # Audio setup
-        self.audio_p = None
-        if self.use_tones:
-            self._init_audio()
+        # Audio setup - use Windows tone generator
+        self.tone_generator = WindowsToneGenerator(self.volume) if self.use_tones else None
         
         # Setup logging
         self.setup_logging()
@@ -299,7 +336,6 @@ class OBSSourceMonitor:
             'volume': 0.4,
             'poll_interval': 0.1,
             'max_consecutive_errors': 3,
-            'sample_rate': 44100,
             'hotkey': 'shift+win+f4',
             'fallback_hotkey': 'ctrl+shift+f4',
             'use_speech': False,  # Default to False
@@ -383,65 +419,11 @@ class OBSSourceMonitor:
         self.logger.addHandler(file_handler)
         self.logger.propagate = False
 
-    def _init_audio(self):
-        """Initialize PyAudio once"""
-        try:
-            self.audio_p = pyaudio.PyAudio()
-        except Exception as e:
-            print(f"Failed to initialize audio: {e}")
-            self.audio_p = None
-
-    def _cleanup_audio(self):
-        """Clean up audio resources"""
-        if self.audio_p:
-            try:
-                self.audio_p.terminate()
-            except:
-                pass
-            self.audio_p = None
-
     def play_tone_blocking(self, frequency, duration=0.1):
-        """Play a single tone - blocking version with improved resource management"""
-        if not self.use_tones or not self.audio_p:
-            if self.use_tones:
-                self._init_audio()
-                if not self.audio_p:
-                    return
-
-        with self.audio_lock:
-            stream = None
-            try:
-                stream = self.audio_p.open(
-                    format=pyaudio.paFloat32,
-                    channels=1,
-                    rate=self.sample_rate,
-                    output=True,
-                    frames_per_buffer=1024
-                )
-                
-                frames = int(duration * self.sample_rate)
-                wave = np.sin(frequency * 2 * np.pi * np.linspace(0, duration, frames))
-                
-                # Improved fade to prevent clicks
-                fade_frames = min(int(0.005 * self.sample_rate), frames // 4)
-                if fade_frames > 0:
-                    fade_in = np.linspace(0, 1, fade_frames)
-                    fade_out = np.linspace(1, 0, fade_frames)
-                    wave[:fade_frames] *= fade_in
-                    wave[-fade_frames:] *= fade_out
-                
-                wave = (wave * self.volume).astype(np.float32)
-                stream.write(wave.tobytes())
-                
-            except Exception as e:
-                self.logger.error(f"Error playing tone {frequency}Hz: {e}")
-            finally:
-                if stream:
-                    try:
-                        stream.stop_stream()
-                        stream.close()
-                    except:
-                        pass
+        """Play a single tone - blocking version"""
+        if not self.use_tones or not self.tone_generator:
+            return
+        self.tone_generator.play_tone_blocking(frequency, duration)
 
     def play_tone(self, frequency, duration=0.1):
         """Play a tone in background thread"""
@@ -450,64 +432,16 @@ class OBSSourceMonitor:
         threading.Thread(target=lambda: self.play_tone_blocking(frequency, duration), daemon=True).start()
 
     def play_chord_blocking(self, frequencies, duration=0.15):
-        """Play multiple frequencies at once - blocking"""
-        if not self.use_tones or not self.audio_p:
-            if self.use_tones:
-                self._init_audio()
-                if not self.audio_p:
-                    return
-
-        with self.audio_lock:
-            stream = None
-            try:
-                stream = self.audio_p.open(
-                    format=pyaudio.paFloat32,
-                    channels=1,
-                    rate=self.sample_rate,
-                    output=True,
-                    frames_per_buffer=1024
-                )
-                
-                frames = int(duration * self.sample_rate)
-                wave = np.zeros(frames)
-                
-                for freq in frequencies:
-                    freq_wave = np.sin(freq * 2 * np.pi * np.linspace(0, duration, frames))
-                    wave += freq_wave / len(frequencies)
-                
-                # Improved fade
-                fade_frames = min(int(0.01 * self.sample_rate), frames // 4)
-                if fade_frames > 0:
-                    fade_in = np.linspace(0, 1, fade_frames)
-                    fade_out = np.linspace(1, 0, fade_frames)
-                    wave[:fade_frames] *= fade_in
-                    wave[-fade_frames:] *= fade_out
-                
-                wave = (wave * self.volume).astype(np.float32)
-                stream.write(wave.tobytes())
-                
-            except Exception as e:
-                self.logger.error(f"Error playing chord: {e}")
-            finally:
-                if stream:
-                    try:
-                        stream.stop_stream()
-                        stream.close()
-                    except:
-                        pass
+        """Play multiple frequencies"""
+        if not self.use_tones or not self.tone_generator:
+            return
+        self.tone_generator.play_chord_blocking(frequencies, duration)
 
     def play_sequence_blocking(self, frequencies, durations, gaps=None):
         """Play a sequence of tones with gaps"""
-        if not self.use_tones:
+        if not self.use_tones or not self.tone_generator:
             return
-            
-        if gaps is None:
-            gaps = [0.05] * (len(frequencies) - 1)
-        
-        for i, (freq, dur) in enumerate(zip(frequencies, durations)):
-            self.play_tone_blocking(freq, dur)
-            if i < len(gaps):
-                time.sleep(gaps[i])
+        self.tone_generator.play_sequence_blocking(frequencies, durations, gaps)
 
     def play_system_sound(self, sound_type: str):
         """Play system notification sounds based on configuration"""
@@ -797,8 +731,6 @@ class OBSSourceMonitor:
             self.monitor_thread.join(timeout=2.0)
         
         self.disconnect_from_obs()
-        if self.use_tones:
-            self._cleanup_audio()
 
 def main():
     """Main function with improved error handling and reconnection logic"""
