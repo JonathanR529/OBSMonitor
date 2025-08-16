@@ -1,6 +1,4 @@
 accessible_output3
 keyboard
-numpy
 obsws_python
-pyaudio
 wxpython
