@@ -31,7 +31,7 @@ If you want to change any configuration settings, just edit the config.json file
 
 Since the program has an invisible interface, you can press Windows Shift F4 to exit.
 
-##Building
+## Building
 
 To build the program from source, simply run the build script.
 
