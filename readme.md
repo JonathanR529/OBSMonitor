@@ -33,7 +33,7 @@ Since the program has an invisible interface, you can press Windows Shift F4 to 
 
 ## Building
 
-To build the program from source, simply run the build script.
+To build the program from source, simply run the build script, making sure [7-Zip](https://7zip.org/) is on your path.
 
 ## Contributing
 
